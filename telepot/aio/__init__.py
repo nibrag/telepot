@@ -1,12 +1,16 @@
 import io
 import json
+import re
 import time
 import asyncio
+import aiohttp
 import traceback
 import collections
 from concurrent.futures._base import CancelledError
-from . import helper, api
+from . import helper
 from .. import _BotBase, flavor, _find_first_key, _isstring, _dismantle_message_identifier, _strip, _rectify
+from .. import exception
+from ..api import _guess_filename
 
 # Patch aiohttp for sending unicode filename
 from . import hack
@@ -21,22 +25,72 @@ class Bot(_BotBase):
     def __init__(self, token, loop=None):
         super(Bot, self).__init__(token)
         self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._closed = False
 
         self._router = helper.Router(flavor, {'chat': helper._delay_yell(self, 'on_chat_message'),
                                               'edited_chat': helper._delay_yell(self, 'on_edited_chat_message'),
                                               'callback_query': helper._delay_yell(self, 'on_callback_query'),
                                               'inline_query': helper._delay_yell(self, 'on_inline_query'),
                                               'chosen_inline_result': helper._delay_yell(self, 'on_chosen_inline_result')})
+        self._client_session = aiohttp.ClientSession(loop=self._loop)
 
     @property
     def loop(self):
         return self._loop
 
+    def close(self):
+        self._client_session.close()
+        self._closed = True
+
+    async def _api_request(self, method, params=None, files=None, **kwargs):
+        api_url = 'https://api.telegram.org/bot%s/%s' % (self._token, method)
+
+        data = aiohttp.helpers.FormData()
+
+        if params:
+            for key, value in params.items():
+                data.add_field(key, str(value))
+
+        if files:
+            for key, f in files.items():
+                if isinstance(f, tuple):
+                    if len(f) == 2:
+                        filename, fileobj = f
+                    else:
+                        raise ValueError('Tuple must have exactly 2 elements: filename, fileobj')
+                else:
+                    filename, fileobj = _guess_filename(f) or key, f
+
+                data.add_field(key, fileobj, filename=filename)
+
+        async with self._client_session.post(url=api_url, data=data) as resp:
+            try:
+                data = await resp.json()
+            except ValueError:
+                text = await resp.text()
+                raise exception.BadHTTPResponse(resp.status, text, resp)
+
+            if data['ok']:
+                return data['result']
+            else:
+                description, error_code = data['description'], data['error_code']
+
+                # Look for specific error ...
+                for e in exception.TelegramError.__subclasses__():
+                    n = len(e.DESCRIPTION_PATTERNS)
+                    if any(map(re.search, e.DESCRIPTION_PATTERNS, n * [description], n * [re.IGNORECASE])):
+                        raise e(description, error_code, data)
+
+                # ... or raise generic error
+                raise exception.TelegramError(description, error_code, data)
+
+
+
     async def handle(self, msg):
         await self._router.route(msg)
 
-    async def _api_request(self, method, params=None, files=None, **kwargs):
-        return await api.request((self._token, method, params, files), **kwargs)
+    # async def _api_request(self, method, params=None, files=None, **kwargs):
+    #     #return await api.request((self._token, method, params, files), **kwargs)
 
     async def getMe(self):
         """ See: https://core.telegram.org/bots/api#getme """
@@ -282,12 +336,15 @@ class Bot(_BotBase):
         """
         f = await self.getFile(file_id)
 
+        url = 'https://api.telegram.org/file/bot%s/%s' % \
+              (self._token, f['file_path'])
+
         try:
             d = dest if isinstance(dest, io.IOBase) else open(dest, 'wb')
 
-            async with api.download((self._token, f['file_path'])) as r:
+            async with self._client_session.get(url) as resp:
                 while 1:
-                    chunk = await r.content.read(self._file_chunk_size)
+                    chunk = await resp.content.read(self._file_chunk_size)
                     if not chunk:
                         break
                     d.write(chunk)
@@ -377,7 +434,7 @@ class Bot(_BotBase):
 
         async def get_from_telegram_server():
             offset = None  # running offset
-            while 1:
+            while not self._closed:
                 try:
                     result = await self.getUpdates(offset=offset, timeout=timeout)
 
@@ -385,13 +442,14 @@ class Bot(_BotBase):
                         # No sort. Trust server to give messages in correct order.
                         # Update offset to max(update_id) + 1
                         offset = max([handle(update) for update in result]) + 1
-                except CancelledError:
+                except (CancelledError, GeneratorExit):
                     raise
                 except:
                     traceback.print_exc()
-                    await asyncio.sleep(0.1)
-                else:
-                    await asyncio.sleep(0.1)
+
+                if self._closed:
+                    break
+                await asyncio.sleep(0.1, loop=self._loop)
 
         def dictify(data):
             if type(data) is bytes:
@@ -404,7 +462,7 @@ class Bot(_BotBase):
                 raise ValueError()
 
         async def get_from_queue_unordered(qu):
-            while 1:
+            while not self._closed:
                 try:
                     data = await qu.get()
                     update = dictify(data)
@@ -419,9 +477,9 @@ class Bot(_BotBase):
             qwait = None                  # how long to wait for updates,
                                           # because buffer's content has to be returned in time.
 
-            while 1:
+            while not self._closed:
                 try:
-                    data = await asyncio.wait_for(qu.get(), qwait)
+                    data = await asyncio.wait_for(qu.get(), qwait, loop=self._loop)
                     update = dictify(data)
 
                     if max_id is None:
@@ -515,9 +573,9 @@ class SpeakerBot(Bot):
         return self._mic
 
     def create_listener(self):
-        q = asyncio.Queue()
+        q = asyncio.Queue(loop=self._loop)
         self._mic.add(q)
-        ln = helper.Listener(self._mic, q)
+        ln = helper.Listener(self._mic, q, loop=self._loop)
         return ln
 
 
@@ -528,6 +586,7 @@ class DelegatorBot(SpeakerBot):
         """
         super(DelegatorBot, self).__init__(token, loop)
         self._delegate_records = [p+({},) for p in delegation_patterns]
+        self._handler_stack = []
 
     def handle(self, msg):
         self._mic.send(msg)
@@ -545,6 +604,15 @@ class DelegatorBot(SpeakerBot):
                         raise RuntimeError('You must produce a coroutine *object* as delegate.')
 
                     dict[id] = self._loop.create_task(c)
+                    self._handler_stack.append(dict[id])
             else:
                 c = make_coroutine_obj((self, msg, id))
-                self._loop.create_task(c)
+                fut = self._loop.create_task(c)
+                self._handler_stack.append(fut)
+
+    def close(self):
+        super().close()
+
+        for fut in self._handler_stack:
+            if not fut.cancelled():
+                fut.cancel()

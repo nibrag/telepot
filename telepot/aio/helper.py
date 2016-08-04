@@ -6,6 +6,7 @@ from .. import flavor, chat_flavors, inline_flavors
 
 # Mirror traditional version
 from ..helper import Timer, Sender, Administrator, Editor, openable
+from concurrent.futures._base import CancelledError
 
 
 async def _yell(fn, *args, **kwargs):
@@ -42,6 +43,11 @@ class Microphone(object):
 
 
 class Listener(helper.Listener):
+    def __init__(self, mic, q, *, loop):
+        self._loop = loop
+        self._stop = False
+        super().__init__(mic, q)
+
     async def wait(self):
         """
         Block until a matched message appears.
@@ -49,15 +55,19 @@ class Listener(helper.Listener):
         if not self._captures:
             raise RuntimeError('Listener has no capture criteria.')
 
-        while 1:
+        while not self._stop:
             short = self._find_shortest_timer()
 
             try:
                 if short:
                     timeleft = short.timeleft()
-                    msg = await asyncio.wait_for(self._queue.get(), 0 if timeleft < 0 else timeleft)
+                    msg = await asyncio.wait_for(self._queue.get(),
+                                                 0 if timeleft < 0 else timeleft,
+                                                 loop=self._loop)
                 else:
                     msg = await self._queue.get()
+            except CancelledError:
+                break
             except asyncio.TimeoutError:
                 if short:
                     # Extract criteria associated with this timeout
@@ -81,8 +91,9 @@ class Listener(helper.Listener):
 
             return msg
 
+    def stop(self):
+        self._stop = True
 
-from concurrent.futures._base import CancelledError
 
 class Answerer(object):
     """
